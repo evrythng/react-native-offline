@@ -1,5 +1,5 @@
 # react-native-offline
-[![All Contributors](https://img.shields.io/badge/all_contributors-32-orange.svg?style=flat-square)](#contributors)
+[![All Contributors](https://img.shields.io/badge/all_contributors-33-orange.svg?style=flat-square)](#contributors)
 [![CircleCI](https://circleci.com/gh/rgommezz/react-native-offline.svg?style=shield)](https://circleci.com/gh/rgommezz/react-native-offline) [![npm version](https://badge.fury.io/js/react-native-offline.svg)](https://badge.fury.io/js/react-native-offline) [![Coverage Status](https://coveralls.io/repos/github/rauliyohmc/react-native-offline/badge.svg?branch=master)](https://coveralls.io/github/rauliyohmc/react-native-offline?branch=master)
 [![npm](https://img.shields.io/npm/dm/react-native-offline.svg)]()
 
@@ -185,7 +185,7 @@ type Props = {
 
 `pingTimeout`: amount of time (in ms) that the component should wait for the ping response. Defaults to `10000` ms. If you want to use a different value, it's recommended to use a higher one.
 
-`pingServerUrl`: remote server to ping to. Defaults to `https://www.google.com/` since it's probably one the most stable servers out there, but you can provide your own if needed.
+`pingServerUrl`: remote server to ping to. Defaults to `https://www.google.com/` since it's probably one the most stable servers out there, but you can provide your own if needed. Warning: www.google.com is a blocked domain in China, so if you need your app to be accessible from there, you MUST use another domain.
 
 `shouldPing`: flag that denotes whether the extra ping check will be performed or not. Defaults to `true`.
 
@@ -347,6 +347,7 @@ type MiddlewareConfig = {
   regexActionType?: RegExp = /FETCH.*REQUEST/,
   actionTypes?: Array<string> = [],
   queueReleaseThrottle?: number = 50,
+  shouldDequeueSelector: (state: RootReduxState) => boolean = () => true
 }
 ```
 
@@ -359,6 +360,9 @@ By default it's configured to intercept actions for fetching data following the 
 `actionTypes`: array with additional action types to intercept that don't fulfil the RegExp criteria. For instance, it's useful for actions that carry along refreshing data, such as `REFRESH_LIST`.
 
 `queueReleaseThrottle`: waiting time in ms between dispatches when flushing the offline queue. Useful to reduce the server pressure when coming back online. Defaults to 50ms.
+
+`shouldDequeueSelector`: function that receives the redux application state and returns a boolean. It'll be executed every time an action is dispatched, before it reaches the reducer. This is useful to control if the queue should be released when the connection is regained and there were actions queued up. Returning `true` (the default behaviour) releases the queue, whereas returning `false` prevents queue release. For example, you may wanna perform some authentication checks, prior to releasing the queue. Note, if the result of `shouldDequeueSelector` changes *while* the queue is being released, the queue will not halt. If you want to halt the queue *while* is being released, please see relevant FAQ section.
+
 
 ##### Thunks Config
 For `redux-thunk` library, the async flow is wrapped inside functions that will be lazily evaluated when dispatched, so our store is able to dispatch functions as well. Therefore, the configuration differs:
@@ -447,7 +451,7 @@ A queue system to store actions that failed due to lack of connectivity. It work
 
 #### Managing duplicate actions
 If a similar action already exists on the queue, we remove it and push it again to the end, so it has an overriding effect.
-The default criteria to detect duplicates is by using `lodash.isEqual` for plain actions and `thunk.toString()` for thunks/functions. However, you can customise the comparison function to acommodate it to your needs. For that, you need to use the factory version for your network reducer.
+The default criteria to detect duplicates is by using `lodash.isEqual` for plain actions and `thunk.toString()` for thunks/functions. However, you can customise the comparison function to acommodate it to your needs. For that, you need to use the factory version for your network reducer. **Please remember to name `network` the key of your reducer**.
 
 ```js
 // configureStore.js
@@ -457,7 +461,8 @@ import { comparisonFn } from './utils';
 
 const rootReducer = combineReducers({
   // ... your other reducers here ...
-  createNetworkReducer(comparisonFn),
+  // Use network key, that's important!
+  network: createNetworkReducer(comparisonFn),
 });
 
 const store = createStore(rootReducer);
@@ -550,16 +555,14 @@ checkInternetConnection(
 ##### Example
 
 ```js
-import { checkInternetConnection, offlineActionTypes } from 'react-native-offline';
+import { checkInternetConnection, offlineActionCreators } from 'react-native-offline';
 
 async function internetChecker(dispatch) {
   const isConnected = await checkInternetConnection();
+  const { connectionChange } = offlineActionCreators;
   // Dispatching can be done inside a connected component, a thunk (where dispatch is injected), saga, or any sort of middleware
   // In this example we are using a thunk
-  dispatch({
-    type: offlineActionTypes.CONNECTION_CHANGE,
-    payload: isConnected,
-  });
+  dispatch(connectionChange(isConnected));
 }
 ```
 
@@ -583,21 +586,19 @@ As you can see in the snippets below, we create the `store` instance as usual an
 // configureStore.js
 import { createStore, applyMiddleware } from 'redux';
 import { persistStore } from 'redux-persist';
-import { createNetworkMiddleware, offlineActionTypes, checkInternetConnection } from 'react-native-offline';
+import { createNetworkMiddleware, offlineActionCreators, checkInternetConnection } from 'react-native-offline';
 import rootReducer from '../reducers';
 
 const networkMiddleware = createNetworkMiddleware();
 
 export default function configureStore(callback) {
   const store = createStore(rootReducer, applyMiddleware(networkMiddleware));
+  const { connectionChange } = offlineActionCreators;
   // https://github.com/rt2zz/redux-persist#persiststorestore-config-callback
   persistStore(store, null, () => {
     // After rehydration completes, we detect initial connection
     checkInternetConnection().then(isConnected => {
-      store.dispatch({
-        type: offlineActionTypes.CONNECTION_CHANGE,
-        payload: isConnected,
-      });
+      store.dispatch(connectionChange(isConnected));
       callback(); // Notify our root component we are good to go, so that we can render our app
     });
   });
@@ -640,25 +641,32 @@ export default App;
 
 This way, we make sure the right actions are dispatched before anything else can be.
 
-#### How to intercept and queue actions when the server responds with client (4xx) or server (5xx) errors
-You can do that by dispatching yourself an action of type `@@network-connectivity/FETCH_OFFLINE_MODE`. The action types the library uses are exposed under `offlineActionTypes` property.
+#### How do I stop the queue *while* it is being released?
 
-Unfortunately, the action creators are not exposed yet, so I'll release soon a new version with that fixed. In the meantime, you can check that specific action creator in  [here](https://github.com/rgommezz/react-native-offline/blob/master/src/actionCreators.js#L18), so that you can emulate its payload. That should queue up your action properly.
+You can do that by dispatching a `CHANGE_QUEUE_SEMAPHORE` action using `changeQueueSemaphore` action creator. This action is used to manually stop and resume the queue even if it's being released.
+
+It works in the following way: if a `changeQueueSemaphore('RED')` action is dispatched, queue release is now halted. It will only resume if another if `changeQueueSemaphore('GREEN')` is dispatched.
 
 ```js
-import { offlineActionTypes } from 'react-native-offline';
+import { offlineActionCreators } from 'react-native-offline';
+...
+async function weHaltQeueeReleaseHere(){
+  const { changeQueueSemaphore } = offlineActionCreators;
+  dispatch(changeQueueSemaphore('RED')) // The queue is now halted and it won't continue dispatching actions
+  await somePromise();
+  dispatch(changeQueueSemaphore('GREEN')) // The queue is now resumed and it will continue dispatching actions
+}
+```
+
+
+#### How to intercept and queue actions when the server responds with client (4xx) or server (5xx) errors
+You can do that by dispatching a `FETCH_OFFLINE_MODE` action using `fetchOfflineMode` action creator.
+
+```js
+import { offlineActionCreators } from 'react-native-offline';
 ...
 fetch('someurl/data').catch(error => {
-  dispatch({
-    type: actionTypes.FETCH_OFFLINE_MODE,
-    payload: {
-      prevAction: {
-        type: action.type, // <-- action is the one that triggered your api call
-        payload: action.payload,
-      },
-    },
-    meta: { retry: true }
-  })
+  dispatch(offlineActionCreators.fetchOfflineMode(action)) // <-- action is the one that triggered your api call
 );
 ```
 
@@ -817,6 +825,7 @@ Thanks goes to these wonderful people ([emoji key](https://github.com/kentcdodds
     <td align="center"><a href="https://github.com/jozr"><img src="https://avatars1.githubusercontent.com/u/8154741?v=4" width="100px;" alt="Josephine Wright"/><br /><sub><b>Josephine Wright</b></sub></a><br /><a href="https://github.com/rgommezz/react-native-offline/commits?author=jozr" title="Documentation">📖</a></td>
     <td align="center"><a href="http://umbrellait.com"><img src="https://avatars0.githubusercontent.com/u/16078455?v=4" width="100px;" alt="Kirill Karpov"/><br /><sub><b>Kirill Karpov</b></sub></a><br /><a href="https://github.com/rgommezz/react-native-offline/commits?author=umbrella-kirill-karpov" title="Code">💻</a></td>
     <td align="center"><a href="https://github.com/LiquidSean"><img src="https://avatars3.githubusercontent.com/u/1811319?v=4" width="100px;" alt="Sean Luthjohn"/><br /><sub><b>Sean Luthjohn</b></sub></a><br /><a href="https://github.com/rgommezz/react-native-offline/commits?author=LiquidSean" title="Code">💻</a> <a href="https://github.com/rgommezz/react-native-offline/commits?author=LiquidSean" title="Documentation">📖</a></td>
+    <td align="center"><a href="https://github.com/cuttlas"><img src="https://avatars2.githubusercontent.com/u/1228574?v=4" width="100px;" alt="cuttlas"/><br /><sub><b>cuttlas</b></sub></a><br /><a href="https://github.com/rgommezz/react-native-offline/commits?author=cuttlas" title="Documentation">📖</a></td>
   </tr>
 </table>
 
